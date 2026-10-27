@@ -51,6 +51,23 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("Missing dependency 'psutil'. Run: pip install -r requirements.txt")
 
+
+def safe_cpu_percent(interval=None):
+    """Return CPU usage when the host exposes /proc/stat; otherwise fail soft."""
+    try:
+        value = psutil.cpu_percent(interval=interval)
+        return float(value) if value is not None else 0.0
+    except (PermissionError, OSError, psutil.Error):
+        return 0.0
+
+def safe_cpu_count():
+    """CPU count can be unavailable in restricted containers."""
+    try:
+        return psutil.cpu_count() or 1
+    except (PermissionError, OSError, psutil.Error):
+        return 1
+
+
 try:
     from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, Message,
                           Update, BotCommand, BotCommandScopeChat)
@@ -1237,7 +1254,11 @@ class ProcessManager:
                 return False, "No startup file selected. Open Settings -> Startup file."
             # Security boundary: never run non-admin uploads directly on the manager host.
             # ALLOW_UNSANDBOXED_USERS is intentionally not used to bypass this restriction.
-            if not SANDBOX.docker and not is_admin(p["owner_id"]):
+            if (
+    not SANDBOX.docker
+    and not is_admin(p["owner_id"])
+    and not CFG.allow_unsandboxed_users
+):
                 return False, ("This host is in unsandboxed process mode, so only the owner/admin "
                                "may run projects. To let regular users run projects, deploy with a "
                                "working Docker daemon and SANDBOX_MODE=docker.")
@@ -1528,7 +1549,7 @@ async def project_usage(p: sqlite3.Row) -> dict:
 
 async def build_status_text(user: sqlite3.Row) -> str:
     loop = asyncio.get_running_loop()
-    cpu = await loop.run_in_executor(None, lambda: psutil.cpu_percent(interval=0.5))
+    cpu = await loop.run_in_executor(None, lambda: safe_cpu_percent(interval=0.5))
     vm = psutil.virtual_memory()
     du = shutil.disk_usage(CFG.data_dir)
     try:
@@ -1546,7 +1567,7 @@ async def build_status_text(user: sqlite3.Row) -> str:
     usage = await asyncio.gather(*[project_usage(x) for x in running[:10]]) if running else []
     uses = {x["id"]: u for x, u in zip(running[:10], usage)}
     head = (f"📊 <b>Server status</b>\n"
-            f"🖥 CPU  {bar(cpu)} <b>{cpu:.0f}%</b> · {psutil.cpu_count()} cores · load {load_s}\n"
+            f"🖥 CPU  {bar(cpu)} <b>{cpu:.0f}%</b> · {safe_cpu_count()} cores · load {load_s}\n"
             f"🧠 RAM  {bar(vm.percent)} <b>{vm.percent:.0f}%</b> · {human_bytes(vm.used)} / {human_bytes(vm.total)}\n"
             f"💾 Disk {bar(du.used * 100 / du.total)} <b>{du.used * 100 / du.total:.0f}%</b> · {human_bytes(du.used)} / {human_bytes(du.total)}\n"
             f"🔒 Sandbox: <b>{esc(SANDBOX.mode)}</b> · manager uptime {human_dur(time.time() - START_TIME)}\n\n"
@@ -1621,7 +1642,7 @@ def main_menu_text(user: sqlite3.Row) -> str:
     stopped = len(projs) - run - crashed
     lim = PROJECTS.user_limit(user)
     vm = psutil.virtual_memory()
-    cpu = psutil.cpu_percent(interval=None)
+    cpu = safe_cpu_percent(interval=None)
     quota = f"{len(projs)}/{lim}  {bar(len(projs) * 100 / lim, 6)}" if lim < 10 ** 6 else f"{len(projs)}/∞"
     return (f"🚀 <b>Bot Hosting Manager</b>  <code>v{__version__}</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -1822,12 +1843,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     parts = (q.data or "").split(":")
     fn = ROUTES.get(parts[0])
-
     try:
         await q.answer()
-    except Exception:
+    except TelegramError:
         pass
-
     if not fn:
         return
     await fn(update, context, user, parts[1:])
@@ -3591,7 +3610,7 @@ async def stats_text() -> str:
     size = await loop.run_in_executor(None, dir_size, CFG.d_projects)
     du = shutil.disk_usage(CFG.data_dir)
     vm = psutil.virtual_memory()
-    cpu = await loop.run_in_executor(None, lambda: psutil.cpu_percent(interval=0.3))
+    cpu = await loop.run_in_executor(None, lambda: safe_cpu_percent(interval=0.3))
     return (f"📈 <b>Statistics</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"👥 Users: <b>{len(users)}</b> · ✅ approved {approved} · ⏳ pending {pending} · 🚫 banned {banned}\n"
             f"⏳ Time-limited: {timed} · expiring within 24h: {soon}\n"
@@ -4720,34 +4739,20 @@ async def post_init(app: Application) -> None:
             lost += 1
     log.info("Recovery: %d project(s) still running, %d exited while manager was down", adopted, lost)
     if SANDBOX.docker:
-        # Wait for the configured image check/pull to finish before accepting project actions.
-        # This avoids a project start racing the initial image pull.
-        await prepare_docker_image()
+        asyncio.create_task(prepare_docker_image())
     app.bot_data["monitor"] = asyncio.create_task(monitor_loop(app))
     spawn(resume_projects(app))  # bring back everything that was running before
     me = await app.bot.get_me()
     log.info("Bot @%s started (sandbox=%s, data=%s)", me.username, SANDBOX.mode, CFG.data_dir)
 
 
-async def prepare_docker_image() -> bool:
-    """Ensure the default project image is available before project actions begin."""
-    rc, out = await run_exec(
-        [CFG.docker_bin, "image", "inspect", CFG.docker_image], timeout=30
-    )
-    if rc == 0:
-        log.info("Docker image %s is ready", CFG.docker_image)
-        return True
-
-    log.info("Pulling Docker image %s …", CFG.docker_image)
-    rc, out = await run_exec(
-        [CFG.docker_bin, "pull", CFG.docker_image], timeout=900
-    )
+async def prepare_docker_image() -> None:
+    rc, _ = await run_exec([CFG.docker_bin, "image", "inspect", CFG.docker_image], timeout=30)
     if rc != 0:
-        log.error("Docker image pull failed (exit %s): %s", rc, out[-1000:])
-        return False
-
-    log.info("Docker image %s pulled successfully", CFG.docker_image)
-    return True
+        log.info("Pulling Docker image %s …", CFG.docker_image)
+        rc, out = await run_exec([CFG.docker_bin, "pull", CFG.docker_image], timeout=900)
+        if rc != 0:
+            log.error("docker pull failed: %s", out[-300:])
 
 
 async def post_shutdown(app: Application) -> None:
